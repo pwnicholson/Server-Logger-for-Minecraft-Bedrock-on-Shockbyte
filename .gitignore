@@ -1,0 +1,7 @@
+# Chrome extension local config
+*.local
+*.secret
+
+# Optional system files
+.DS_Store
+Thumbs.db

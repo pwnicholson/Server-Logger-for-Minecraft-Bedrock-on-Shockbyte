@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "Shockbyte Server Logger",
+  "version": "0.0.5",
+  "description": "Monitor Shockbyte console events and prepare data for Google Sheets.",
+  "permissions": ["storage", "tabs", "alarms", "identity"],
+  "host_permissions": ["https://panel.shockbyte.com/*", "https://sheets.googleapis.com/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Shockbyte Server Logger"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://panel.shockbyte.com/*"],
+      "js": ["content-script.js"],
+      "run_at": "document_end"
+    }
+  ]
+}

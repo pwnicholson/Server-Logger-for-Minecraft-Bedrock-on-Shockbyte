@@ -1,0 +1,49 @@
+# Shockbyte Server Logger for Minecraft Bedrock
+
+Version 0.0.5
+
+A Chrome extension that reads Shockbyte console pages, parses server events, and prepares data for Google Sheets.
+
+## What is included
+
+- `manifest.json`: Chrome extension manifest (Manifest V3)
+- `background.js`: opens the setup screen on install and when the icon is clicked
+- `content-script.js`: scans the Shockbyte console page for new messages and parses events
+- `setup.html` / `setup.js`: setup flow, OAuth authorization, and configuration UI
+- `style.css`: simple styling for the setup page
+
+## How to use
+
+1. Clone this repo to your local machine.
+2. Open Chrome and go to `chrome://extensions/`.
+3. Enable Developer mode.
+4. Click `Load unpacked` and select this folder.
+5. In the setup screen, enter your Google OAuth client ID and the Google Sheet ID you want to write to.
+6. Choose which event types to log.
+7. Optionally enter custom keywords, separated by commas, to log any console lines that contain those phrases.
+8. Click `Save settings`.
+9. Click `Authorize Google` and sign in to your Google account.
+10. Open the Shockbyte console at `https://panel.shockbyte.com/` and keep it open.
+
+## What happens next
+
+- The extension watches the Shockbyte console page for matching log lines.
+- Parsed events are automatically sent to Google Sheets once authorization is complete.
+- Events are written as rows with separate columns for:
+  - timestamp
+  - event type
+  - server name
+  - server address
+  - location
+  - server version
+  - player slots
+  - player name
+  - keyword or extra details
+- If verbose logging is enabled, every unique console line is also copied verbatim into a secondary sheet tab named `Verbatim`.
+- If the extension is not yet authorized or the sheet is not configured, matching events are saved locally and uploaded later.
+
+## Notes
+
+- The extension stores configuration and authorization data locally in Chrome storage.
+- This repo does not include any private Google Cloud secrets.
+- The extension uses OAuth to connect to Google Sheets without storing a password.

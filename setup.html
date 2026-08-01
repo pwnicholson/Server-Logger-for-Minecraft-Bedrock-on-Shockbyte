@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Shockbyte Server Logger Setup</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main>
+    <h1>Shockbyte Server Logger</h1>
+    <p>This extension monitors the Shockbyte console page and parses key events.</p>
+
+    <section>
+      <h2>Step 1: Configure this extension</h2>
+      <form id="setup-form">
+        <label>
+          Google OAuth Client ID
+          <input type="text" id="client-id" placeholder="YOUR_CLIENT_ID.apps.googleusercontent.com" required />
+        </label>
+        <label>
+          Google Sheet ID
+          <input type="text" id="sheet-id" placeholder="Spreadsheet ID from the URL" required />
+        </label>
+        <fieldset>
+          <legend>Log only these event types</legend>
+          <label><input type="checkbox" name="event-type" value="server_start" checked /> Server start events</label>
+          <label><input type="checkbox" name="event-type" value="server_stop" checked /> Server stop events</label>
+          <label><input type="checkbox" name="event-type" value="server_update" checked /> Server update events</label>
+          <label><input type="checkbox" name="event-type" value="player_join" checked /> Player join events</label>
+          <label><input type="checkbox" name="event-type" value="player_leave" checked /> Player leave events</label>
+          <label><input type="checkbox" name="event-type" value="custom_keyword" /> Custom keyword matches</label>
+        </fieldset>
+        <label>
+          Custom keywords (comma-separated)
+          <input type="text" id="custom-keywords" placeholder="restart, crashed, error" />
+        </label>
+        <label>
+          <input type="checkbox" id="verbose-logging" /> Enable verbose logging to a secondary sheet tab named Verbatim
+        </label>
+        <button type="submit">Save settings</button>
+      </form>
+      <div id="status"></div>
+    </section>
+
+    <section>
+      <h2>Step 2: Authorize Google</h2>
+      <button id="authorize-button">Authorize Google</button>
+      <div id="auth-status"></div>
+      <p class="small">If you are using your own OAuth client, this extension will display the exact redirect URI needed for that client. Register the URI below in your OAuth client settings to fix redirect_uri_mismatch errors.</p>
+      <pre id="redirect-uri">Loading...</pre>
+      <button id="copy-redirect" class="small-button">Copy redirect URI</button>
+      <div id="redirect-warning" class="small"></div>
+    </section>
+
+    <section>
+      <h2>Step 3: Open Shockbyte</h2>
+      <p>Open the Shockbyte console page at <code>https://panel.shockbyte.com/</code> and keep it open.</p>
+      <p>Once authorized, the extension can use Google Sheets access to save parsed server events.</p>
+    </section>
+  </main>
+
+  <script src="setup.js"></script>
+</body>
+</html>
