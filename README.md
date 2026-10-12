@@ -28,7 +28,9 @@ A Chrome extension that reads Shockbyte console pages, parses server events, and
 ## What happens next
 
 - The extension watches the Shockbyte console page for matching log lines.
+- If the console reports a disconnection, the extension automatically refreshes the page, waiting at least 30 seconds between attempts and stopping after three attempts until the error clears.
 - Parsed events are automatically sent to Google Sheets once authorization is complete.
+- Recently logged events are remembered locally to prevent repeat rows after refresh. A `player connected` and `player spawned` pair for the same player within 15 seconds is treated as one join.
 - Events are written as rows with separate columns for:
   - timestamp
   - event type

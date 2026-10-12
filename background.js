@@ -1,9 +1,15 @@
 const SETUP_PAGE = 'setup.html';
-const HEADER_ROW = ['Timestamp (UTC)', 'Event Type', 'Server Name', 'Server Address', 'Location', 'Server Version', 'Player Slots', 'Players Online', 'Player Name'];
+const HEADER_ROW = ['Timestamp (UTC)', 'Event Type', 'Server Name', 'Server Address', 'Location', 'Server Version', 'Player Slots', 'Player Name'];
 const VERBATIM_HEADER_ROW = ['Timestamp (UTC)', 'Verbatim Line'];
 const DEFAULT_SHEET_TITLE = 'ServerLogs';
 const VERBATIM_SHEET_TITLE = 'Verbatim';
 const DEFAULT_EVENT_TYPES = ['server_start', 'server_stop', 'player_join', 'player_leave'];
+const EVENT_SIGNATURES_KEY = 'loggedEventSignatures';
+const MAX_EVENT_SIGNATURES = 5000;
+const inFlightEventSignatures = new Set();
+const recentJoinSourceClaims = [];
+const JOIN_SOURCE_PAIR_WINDOW_MS = 15_000;
+const MAX_RECENT_JOIN_SOURCE_CLAIMS = 500;
 
 function openSetupPage() {
   chrome.tabs.create({ url: chrome.runtime.getURL(SETUP_PAGE) });
@@ -42,13 +48,108 @@ function buildRowForEvent(event) {
     event.serverLocation || '',
     event.serverVersion || '',
     event.playerSlots || '',
-    event.playersOnline || '',
     event.playerName || ''
   ];
 }
 
 function buildRawRow(timestamp, line) {
   return [formatTimestamp(timestamp), line || ''];
+}
+
+function getEventSignature(event) {
+  return JSON.stringify([
+    formatTimestamp(event.timestamp || new Date().toISOString()),
+    String(event.logType || '').trim().toLowerCase(),
+    String(event.type || '').trim().toLowerCase(),
+    String(event.playerName || '').trim().toLowerCase(),
+    String(event.keyword || '').trim().toLowerCase()
+  ]);
+}
+
+function rememberEventSignatures(sheetId, events, callback = () => {}) {
+  const storageKey = `${EVENT_SIGNATURES_KEY}:${sheetId || 'unconfigured'}`;
+  const newSignatures = events.map(getEventSignature);
+  chrome.storage.local.get({ [storageKey]: [] }, (result) => {
+    const signatures = new Set(result[storageKey] || []);
+    newSignatures.forEach((signature) => signatures.add(signature));
+    chrome.storage.local.set({ [storageKey]: Array.from(signatures).slice(-MAX_EVENT_SIGNATURES) }, callback);
+  });
+}
+
+function claimJoinSource(sheetId, event, callback) {
+  const playerName = String(event.playerName || '').trim().toLowerCase();
+  const timestamp = Date.parse(event.timestamp);
+  if (event.logType !== 'player_join' || !event.joinSource || !playerName || !Number.isFinite(timestamp)) {
+    callback(true);
+    return;
+  }
+
+  const storageKey = `recentJoinSources:${sheetId || 'unconfigured'}`;
+  const claim = { playerName, source: event.joinSource, timestamp };
+  const isPairedSource = (records) => records.some((record) => (
+    record.playerName === playerName
+    && record.source !== event.joinSource
+    && Math.abs(record.timestamp - timestamp) <= JOIN_SOURCE_PAIR_WINDOW_MS
+  ));
+
+  if (isPairedSource(recentJoinSourceClaims)) {
+    callback(false);
+    return;
+  }
+
+  recentJoinSourceClaims.push(claim);
+  recentJoinSourceClaims.splice(0, recentJoinSourceClaims.length - MAX_RECENT_JOIN_SOURCE_CLAIMS);
+
+  chrome.storage.local.get({ [storageKey]: [] }, (result) => {
+    const records = result[storageKey] || [];
+    if (isPairedSource(records)) {
+      callback(false);
+      return;
+    }
+
+    const updatedRecords = [...records, claim].slice(-MAX_RECENT_JOIN_SOURCE_CLAIMS);
+    chrome.storage.local.set({ [storageKey]: updatedRecords }, () => callback(true));
+  });
+}
+
+function claimEventSignature(sheetId, event, callback) {
+  const signature = getEventSignature(event);
+  const storageKey = `${EVENT_SIGNATURES_KEY}:${sheetId || 'unconfigured'}`;
+  const inFlightKey = `${storageKey}:${signature}`;
+  if (inFlightEventSignatures.has(inFlightKey)) {
+    callback(false);
+    return;
+  }
+
+  inFlightEventSignatures.add(inFlightKey);
+  chrome.storage.local.get({ [storageKey]: [], events: [] }, (result) => {
+    const signatures = result[storageKey] || [];
+    const isPending = (result.events || []).some((pendingEvent) => getEventSignature(pendingEvent) === signature);
+    if (signatures.includes(signature) || isPending) {
+      inFlightEventSignatures.delete(inFlightKey);
+      callback(false, () => {});
+      return;
+    }
+
+    claimJoinSource(sheetId, event, (shouldWriteJoin) => {
+      if (!shouldWriteJoin) {
+        inFlightEventSignatures.delete(inFlightKey);
+        callback(false, () => {});
+        return;
+      }
+
+      callback(true, (writeSucceeded) => {
+        if (!writeSucceeded) {
+          inFlightEventSignatures.delete(inFlightKey);
+          return;
+        }
+
+        rememberEventSignatures(sheetId, [event], () => {
+          inFlightEventSignatures.delete(inFlightKey);
+        });
+      });
+    });
+  });
 }
 
 function setLogSheetTitle(title, callback) {
@@ -136,7 +237,27 @@ function isHeaderRow(row, headerRow) {
 
 function ensureLogSheet(accessToken, sheetId, storedTitle, callback) {
   if (storedTitle) {
-    ensureSheetWithHeader(accessToken, sheetId, storedTitle, HEADER_ROW, callback);
+    const metadataUrl = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(sheetId)}?fields=sheets(properties(title))`;
+    fetchJson(accessToken, metadataUrl).then((result) => {
+      if (result.ok) {
+        const sheets = result.data.sheets || [];
+        const storedSheetExists = sheets.some((sheet) => sheet.properties?.title === storedTitle);
+        if (!storedSheetExists) {
+          const signatureKey = `${EVENT_SIGNATURES_KEY}:${sheetId}`;
+          chrome.storage.local.remove(signatureKey, () => {
+            createSheet(accessToken, sheetId, storedTitle, HEADER_ROW, (sheetTitle) => {
+              setLogSheetTitle(sheetTitle, () => callback(sheetTitle));
+            });
+          });
+          return;
+        }
+      }
+
+      ensureSheetWithHeader(accessToken, sheetId, storedTitle, HEADER_ROW, callback);
+    }).catch((error) => {
+      console.warn('Could not verify the log sheet exists:', error);
+      ensureSheetWithHeader(accessToken, sheetId, storedTitle, HEADER_ROW, callback);
+    });
     return;
   }
 
@@ -226,12 +347,21 @@ function flushPendingEvents(accessToken, sheetId, storedTitle) {
     const events = result.events || [];
     if (!events.length) return;
 
+    const uniqueEvents = [];
+    const signatures = new Set();
+    for (const event of events) {
+      const signature = getEventSignature(event);
+      if (signatures.has(signature)) continue;
+      signatures.add(signature);
+      uniqueEvents.push(event);
+    }
+
     ensureLogSheet(accessToken, sheetId, storedTitle, (sheetTitle) => {
-      const rows = events.map(buildRowForEvent);
+      const rows = uniqueEvents.map(buildRowForEvent);
       appendRowsToSheet(accessToken, sheetId, sheetTitle, rows)
         .then((response) => {
           if (response.ok) {
-            chrome.storage.local.remove('events');
+            rememberEventSignatures(sheetId, uniqueEvents, () => chrome.storage.local.remove('events'));
           } else {
             console.warn('Could not flush pending events:', response.status, response.statusText);
           }
@@ -292,36 +422,47 @@ function handleParsedEvent(event, senderUrl) {
       return;
     }
 
-    if (!accessToken || !sheetId) {
-      savePendingEvent(savedEvent, () => {
-        console.log('Event saved locally until OAuth and sheet settings are configured.', savedEvent);
-      });
-      return;
-    }
+    claimEventSignature(sheetId, savedEvent, (isNewEvent, finishSignature) => {
+      if (!isNewEvent) return;
 
-    ensureLogSheet(accessToken, sheetId, logSheetTitle, (sheetTitle) => {
-      const row = buildRowForEvent(savedEvent);
-      appendRowsToSheet(accessToken, sheetId, sheetTitle, [row])
-        .then((response) => {
-          if (!response.ok) {
+      if (!accessToken || !sheetId) {
+        savePendingEvent(savedEvent, () => {
+          finishSignature(false);
+          console.log('Event saved locally until OAuth and sheet settings are configured.', savedEvent);
+        });
+        return;
+      }
+
+      ensureLogSheet(accessToken, sheetId, logSheetTitle, (sheetTitle) => {
+        const row = buildRowForEvent(savedEvent);
+        appendRowsToSheet(accessToken, sheetId, sheetTitle, [row])
+          .then((response) => {
+            if (response.ok) {
+              finishSignature(true);
+              return;
+            }
+
             if (response.status === 401 || response.status === 403) {
               chrome.storage.local.remove(['googleAccessToken', 'tokenExpiry'], () => {
                 savePendingEvent(savedEvent, () => {
+                  finishSignature(false);
                   console.warn('Authorization failed. Saved event locally and cleared expired token. Re-authorize in setup.');
                 });
               });
             } else {
               savePendingEvent(savedEvent, () => {
+                finishSignature(false);
                 console.warn('Failed to append event to Google Sheets. Saved locally.', response.status);
               });
             }
-          }
-        })
-        .catch((error) => {
-          savePendingEvent(savedEvent, () => {
-            console.warn('Network or Sheets API error. Saved event locally.', error);
+          })
+          .catch((error) => {
+            savePendingEvent(savedEvent, () => {
+              finishSignature(false);
+              console.warn('Network or Sheets API error. Saved event locally.', error);
+            });
           });
-        });
+      });
     });
   });
 }

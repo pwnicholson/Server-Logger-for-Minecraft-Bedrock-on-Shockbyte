@@ -7,8 +7,7 @@ let serverMetadata = {
   serverAddress: '',
   serverLocation: '',
   serverVersion: '',
-  playerSlots: '',
-  playersOnline: ''
+  playerSlots: ''
 };
 
 function normalizeText(text) {
@@ -21,7 +20,7 @@ function escapeRegExp(value) {
 
 function cleanMetadataValue(text) {
   return normalizeText(text)
-    .replace(/\s+(copy|transfer edit|edit|transfer|server type|manage plan|quick tasks|view all active)$/i, '')
+    .replace(/\s*(copy|transfer edit|edit|transfer|server type|manage plan|quick tasks|view all active|rename|change slots)$/i, '')
     .trim();
 }
 
@@ -29,14 +28,37 @@ function findLabelValue(labels) {
   const lowerLabels = labels.map((label) => normalizeText(label).toLowerCase());
   const candidates = Array.from(document.querySelectorAll('body *')).filter((el) => el.childElementCount === 0 && el.textContent && el.textContent.trim().length > 0);
 
+  function valueFrom(element) {
+    const adjacentElements = [
+      element.nextElementSibling,
+      element.parentElement?.nextElementSibling,
+      element.parentElement?.parentElement?.nextElementSibling
+    ];
+    for (const adjacent of adjacentElements) {
+      const value = cleanMetadataValue(adjacent?.innerText || adjacent?.textContent || '');
+      if (value && !lowerLabels.includes(value.toLowerCase())) return value;
+    }
+
+    let container = element.parentElement;
+    for (let depth = 0; container && depth < 3; depth += 1, container = container.parentElement) {
+      const containerText = normalizeText(container.innerText || container.textContent || '');
+      for (const label of labels) {
+        const match = containerText.match(new RegExp(`^${escapeRegExp(label)}\\s*[:\\-]?\\s*(.+)$`, 'i'));
+        if (match && match[1]) return cleanMetadataValue(match[1]);
+      }
+    }
+
+    return '';
+  }
+
   for (const el of candidates) {
     const raw = normalizeText(el.textContent);
     const lower = raw.toLowerCase();
 
     for (const label of lowerLabels) {
       if (lower === label) {
-        const next = normalizeText(el.nextElementSibling?.textContent || el.parentElement?.nextElementSibling?.textContent || '');
-        if (next) return cleanMetadataValue(next);
+        const value = valueFrom(el);
+        if (value) return value;
       }
 
       if (lower.startsWith(label + ':')) {
@@ -44,7 +66,7 @@ function findLabelValue(labels) {
       }
 
       if (lower.includes(label + ':')) {
-        const match = raw.match(new RegExp(`${escapeRegExp(label)}\s*[:\-]?\s*(.+)`, 'i'));
+        const match = raw.match(new RegExp(`${escapeRegExp(label)}\\s*[:\\-]?\\s*(.+)`, 'i'));
         if (match && match[1]) return cleanMetadataValue(match[1]);
       }
     }
@@ -57,17 +79,22 @@ function extractMetadataFromPage() {
   const metadata = {};
   metadata.serverName = findLabelValue(['Server Name', 'Server']);
   metadata.serverAddress = findLabelValue(['Server Address', 'Address', 'Host']);
-  metadata.serverLocation = findLabelValue(['Location', 'Server Location']);
-  metadata.serverVersion = findLabelValue(['Version', 'Server Version']);
-  metadata.playersOnline = findLabelValue(['Players Online', 'Players online']);
-  metadata.playerSlots = findLabelValue(['Players', 'Slots']);
+  metadata.serverLocation = findLabelValue(['Server Location', 'Location', 'Region', 'Data Center', 'Datacenter'])
+    .replace(/\s+\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b.*$/, '')
+    .replace(/\s+\d+\s*ms\b.*$/i, '')
+    .trim();
+  metadata.serverVersion = findLabelValue([
+    'Server Version', 'Minecraft Version', 'Minecraft Bedrock Version', 'Bedrock Version',
+    'Game Version', 'Software Version', 'Version Number', 'Current Version', 'Version', 'Software'
+  ]);
+  metadata.playerSlots = findLabelValue(['Player Slots', 'Slots', 'Max Players']);
 
-  if (!metadata.playersOnline) {
-    const match = normalizeText(document.body?.innerText || document.body?.textContent || '').match(/players\s+online\s*[:\-]?\s*([0-9]+)\s*\/\s*([0-9]+)/i);
-    if (match) {
-      metadata.playersOnline = normalizeText(match[1]);
-      metadata.playerSlots = normalizeText(match[2]);
-    }
+  const pageText = normalizeText(document.body?.innerText || document.body?.textContent || '');
+  if (!metadata.serverVersion) {
+    const versionMatch = pageText.match(/\b(?:Bedrock|Minecraft|Java)\s+\d+(?:\.\d+)+(?:[-+][A-Za-z0-9._+-]+)?/i)
+      || pageText.match(/\b(?:server|minecraft|bedrock|game|software)\s+version\s*[:\-]?\s*([A-Za-z0-9._+-]+)/i)
+      || pageText.match(/\bversion\s*[:\-]?\s*((?:[A-Za-z][A-Za-z0-9._+-]*[- ]?)?\d+(?:\.\d+)+(?:[-+][A-Za-z0-9._+-]+)?)/i);
+    if (versionMatch) metadata.serverVersion = (versionMatch[1] || versionMatch[0]).trim();
   }
 
   return metadata;
@@ -83,8 +110,7 @@ function mergeMetadata(existing, parsed) {
     serverAddress: parsed.serverAddress || existing.serverAddress,
     serverLocation: parsed.serverLocation || existing.serverLocation,
     serverVersion: parsed.serverVersion || existing.serverVersion,
-    playerSlots: parsed.playerSlots || existing.playerSlots,
-    playersOnline: parsed.playersOnline || existing.playersOnline
+    playerSlots: parsed.playerSlots || existing.playerSlots
   };
 }
 
@@ -154,6 +180,7 @@ function parseConsoleLine(text, explicitTimestamp) {
     return {
       logType: 'player_join',
       type: 'Player joined',
+      joinSource: 'spawned',
       playerName: spawnedMatch ? normalizeText(spawnedMatch[1]) : '',
       timestamp,
       details: normalizedText,
@@ -166,6 +193,7 @@ function parseConsoleLine(text, explicitTimestamp) {
     return {
       logType: 'player_join',
       type: 'Player joined',
+      joinSource: 'connected',
       playerName: playerConnectedMatch ? normalizeText(playerConnectedMatch[1]) : '',
       timestamp,
       details: normalizedText,
@@ -269,6 +297,40 @@ function getConsoleLines() {
 let scanInterval = null;
 let scanActive = true;
 let observer = null;
+const disconnectRefreshStorageKey = 'shockbyteConsoleDisconnectRefresh';
+const minimumRefreshIntervalMs = 30_000;
+const maximumDisconnectRefreshes = 3;
+
+function monitorConsoleConnection() {
+  const pageText = normalizeText(document.body?.innerText || document.body?.textContent || '');
+  const isDisconnected = /server\s+connection\s+lost/i.test(pageText)
+    || /panel\s+can't\s+connect\s+to\s+your\s+server\s+for\s+realtime\s+events/i.test(pageText)
+    || /console\s+(?:(?:is|has been|was)\s+)?disconnected/i.test(pageText)
+    || /disconnected\s+from\s+(?:the\s+)?console/i.test(pageText)
+    || /(?:console\s+connection|connection\s+to\s+(?:the\s+)?console)\s+(?:(?:is|has been|was)\s+)?(?:lost|closed|disconnected)/i.test(pageText);
+
+  let refreshState = { attempts: 0, lastRefreshAt: 0 };
+  try {
+    refreshState = JSON.parse(sessionStorage.getItem(disconnectRefreshStorageKey) || JSON.stringify(refreshState));
+  } catch (error) {
+    return;
+  }
+
+  if (!isDisconnected) {
+    sessionStorage.removeItem(disconnectRefreshStorageKey);
+    return;
+  }
+
+  const now = Date.now();
+  if (refreshState.attempts >= maximumDisconnectRefreshes || now - refreshState.lastRefreshAt < minimumRefreshIntervalMs) return;
+
+  try {
+    sessionStorage.setItem(disconnectRefreshStorageKey, JSON.stringify({ attempts: refreshState.attempts + 1, lastRefreshAt: now }));
+  } catch (error) {
+    return;
+  }
+  window.location.reload();
+}
 
 function stopScanning() {
   scanActive = false;
@@ -351,6 +413,7 @@ function scanConsole() {
   if (!scanActive) return;
 
   try {
+    monitorConsoleConnection();
     const pageMetadata = extractMetadataFromPage();
     if (Object.values(pageMetadata).some(Boolean)) {
       serverMetadata = mergeMetadata(serverMetadata, pageMetadata);

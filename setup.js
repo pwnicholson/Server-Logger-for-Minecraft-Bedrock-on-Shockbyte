@@ -35,6 +35,22 @@ function parseHashParams(url) {
   }, {});
 }
 
+function extractSpreadsheetId(value) {
+  const input = value.trim();
+  if (!input.includes('://')) {
+    return /^[A-Za-z0-9_-]+$/.test(input) ? input : null;
+  }
+
+  try {
+    const url = new URL(input);
+    if (url.hostname !== 'docs.google.com') return null;
+    const match = url.pathname.match(/^\/spreadsheets\/d\/([A-Za-z0-9_-]+)/);
+    return match ? match[1] : null;
+  } catch (error) {
+    return null;
+  }
+}
+
 function loadSettings() {
   chrome.storage.local.get(['googleClientId', 'sheetId', 'googleAccessToken', 'tokenExpiry', 'enabledEventTypes', 'customKeywords', 'verboseLoggingEnabled'], (result) => {
     if (result.googleClientId) clientIdInput.value = result.googleClientId;
@@ -121,18 +137,36 @@ function authorizeGoogle() {
 form.addEventListener('submit', (event) => {
   event.preventDefault();
   const googleClientId = clientIdInput.value.trim();
-  const sheetId = sheetIdInput.value.trim();
+  const sheetId = extractSpreadsheetId(sheetIdInput.value);
   const enabledEventTypes = eventTypeCheckboxes.filter((checkbox) => checkbox.checked).map((checkbox) => checkbox.value);
   const customKeywords = customKeywordsInput.value.split(',').map((keyword) => keyword.trim()).filter(Boolean).join(', ');
   const verboseLoggingEnabled = verboseLoggingCheckbox.checked;
 
   if (!googleClientId || !sheetId) {
-    setStatus('Please enter both the OAuth client ID and sheet ID.', true);
+    setStatus('Enter a Google OAuth client ID and a valid Google Spreadsheet URL or ID.', true);
     return;
   }
 
-  chrome.storage.local.set({ googleClientId, sheetId, enabledEventTypes, customKeywords, verboseLoggingEnabled }, () => {
-    setStatus('Settings saved locally. Click Authorize Google to connect.');
+  chrome.storage.local.get(['googleClientId', 'googleAccessToken', 'tokenExpiry'], (result) => {
+    const clientIdChanged = result.googleClientId !== googleClientId;
+    chrome.storage.local.set({ googleClientId, sheetId, enabledEventTypes, customKeywords, verboseLoggingEnabled }, () => {
+      const finishSave = () => {
+        setStatus('Settings saved locally.');
+        if (clientIdChanged) {
+          setAuthStatus('OAuth client ID changed. Click Authorize Google to connect with the new client.', true);
+        } else if (result.googleAccessToken && Date.now() < (result.tokenExpiry || 0)) {
+          setAuthStatus('Google authorization is still active; settings changes do not require reauthorization.');
+        } else {
+          setAuthStatus('Google authorization is missing or expired. Click Authorize Google to connect.', true);
+        }
+      };
+
+      if (clientIdChanged) {
+        chrome.storage.local.remove(['googleAccessToken', 'tokenExpiry'], finishSave);
+      } else {
+        finishSave();
+      }
+    });
   });
 });
 
