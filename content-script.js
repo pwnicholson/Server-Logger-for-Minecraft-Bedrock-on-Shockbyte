@@ -483,5 +483,5 @@ window.addEventListener('load', () => {
     loadSettings();
     scanConsole();
   }, 3000);
-  window.addEventListener('unload', stopScanning);
+  window.addEventListener('pagehide', stopScanning);
 });
