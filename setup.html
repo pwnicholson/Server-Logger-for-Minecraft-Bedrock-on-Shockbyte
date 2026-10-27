@@ -15,13 +15,9 @@
       <h2>Step 1: Configure this extension</h2>
       <form id="setup-form">
         <label>
-          Google OAuth Client ID
-          <input type="text" id="client-id" placeholder="YOUR_CLIENT_ID.apps.googleusercontent.com" required />
-        </label>
-        <label>
           Google Spreadsheet URL
           <input type="text" id="sheet-id" placeholder="https://docs.google.com/spreadsheets/d/..." required />
-          <span class="small">Paste the full spreadsheet URL. A spreadsheet ID also works.</span>
+          <span class="small">Paste the full spreadsheet URL. A spreadsheet ID also works. This setting syncs with your Chrome profile.</span>
         </label>
         <fieldset>
           <legend>Log only these event types</legend>
@@ -48,10 +44,7 @@
       <h2>Step 2: Authorize Google</h2>
       <button id="authorize-button">Authorize Google</button>
       <div id="auth-status"></div>
-      <p class="small">If you are using your own OAuth client, this extension will display the exact redirect URI needed for that client. Register the URI below in your OAuth client settings to fix redirect_uri_mismatch errors.</p>
-      <pre id="redirect-uri">Loading...</pre>
-      <button id="copy-redirect" class="small-button">Copy redirect URI</button>
-      <div id="redirect-warning" class="small"></div>
+      <p class="small">Authorize once. Chrome manages short-lived access tokens and refreshes them when needed.</p>
     </section>
 
     <section>

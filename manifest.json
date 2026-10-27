@@ -1,9 +1,14 @@
 {
   "manifest_version": 3,
   "name": "Shockbyte Server Logger",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "description": "Monitor Shockbyte console events and prepare data for Google Sheets.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAsUlqDqgR+F3jjLOcq5gAWq9yFIW1d399MQxE3LXSMaFkQPXz05mGI9jp59CcwkcIOVvQcY0YuYu4owp7ciRrWrvMqcPIfxvy5ySRli7jbkcML+4k37CKOnZkNtv4ULBieSHIpHMOGBpDahNUD1LND0R7pl1DwJT1Qyt1OQzRthLIWoARO56YIKwdufvePFXc6jd333sDYfGqjlbpb9y2rJYUj2/dbggyd+9hrK3V3ErUixF6ygBKxE3Toa+jLxt3ndYfDcND82/xUI96ovGaOKxouFOzV/ahZb+U3m14T4LWK7lRZ5klxsyvs/MYFbp2z96/uB4JGWrFt78efwOuIQIDAQAB",
   "permissions": ["storage", "tabs", "alarms", "identity"],
+  "oauth2": {
+    "client_id": "447706288592-ismhu2i819nidbln33pqkckaflssa2fh.apps.googleusercontent.com",
+    "scopes": ["https://www.googleapis.com/auth/spreadsheets"]
+  },
   "host_permissions": ["https://panel.shockbyte.com/*", "https://sheets.googleapis.com/*"],
   "background": {
     "service_worker": "background.js"

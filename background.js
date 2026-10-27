@@ -7,6 +7,8 @@ const DEFAULT_EVENT_TYPES = ['server_start', 'server_stop', 'player_join', 'play
 const EVENT_SIGNATURES_KEY = 'loggedEventSignatures';
 const MAX_EVENT_SIGNATURES = 5000;
 const inFlightEventSignatures = new Set();
+const sheetEventSignatures = new Map();
+const sheetSignatureLoadCallbacks = new Map();
 const recentJoinSourceClaims = [];
 const JOIN_SOURCE_PAIR_WINDOW_MS = 15_000;
 const MAX_RECENT_JOIN_SOURCE_CLAIMS = 500;
@@ -26,16 +28,34 @@ function formatTimestamp(timestamp) {
   return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
 }
 
+function getChromeAccessToken(callback) {
+  chrome.identity.getAuthToken({ interactive: false }, (result) => {
+    const token = typeof result === 'string' ? result : result?.token;
+    const error = chrome.runtime.lastError;
+    callback(token || null, error?.message || null);
+  });
+}
+
 function getStoredState(callback) {
-  chrome.storage.local.get(['googleAccessToken', 'tokenExpiry', 'sheetId', 'enabledEventTypes', 'logSheetTitle', 'verboseLoggingEnabled'], (result) => {
-    const accessToken = result.googleAccessToken;
-    const tokenExpiry = result.tokenExpiry || 0;
-    const sheetId = result.sheetId;
+  chrome.storage.local.get(['sheetId', 'enabledEventTypes', 'verboseLoggingEnabled'], (result) => {
     const enabledEventTypes = result.enabledEventTypes || DEFAULT_EVENT_TYPES;
-    const logSheetTitle = result.logSheetTitle;
     const verboseLoggingEnabled = !!result.verboseLoggingEnabled;
-    const validToken = accessToken && Date.now() < tokenExpiry ? accessToken : null;
-    callback({ accessToken: validToken, sheetId, enabledEventTypes, logSheetTitle, verboseLoggingEnabled });
+    chrome.storage.sync.get(['sheetId'], (syncResult) => {
+      const syncError = chrome.runtime.lastError;
+      const sheetId = !syncError && syncResult.sheetId ? syncResult.sheetId : result.sheetId;
+
+      if (!syncError && !syncResult.sheetId && result.sheetId) {
+        chrome.storage.sync.set({ sheetId }, () => {
+          if (!chrome.runtime.lastError) chrome.storage.local.remove('sheetId');
+        });
+      } else if (syncResult.sheetId && result.sheetId) {
+        chrome.storage.local.remove('sheetId');
+      }
+
+      getChromeAccessToken((accessToken) => {
+        callback({ accessToken, sheetId, enabledEventTypes, verboseLoggingEnabled });
+      });
+    });
   });
 }
 
@@ -59,20 +79,72 @@ function buildRawRow(timestamp, line) {
 function getEventSignature(event) {
   return JSON.stringify([
     formatTimestamp(event.timestamp || new Date().toISOString()),
-    String(event.logType || '').trim().toLowerCase(),
-    String(event.type || '').trim().toLowerCase(),
-    String(event.playerName || '').trim().toLowerCase(),
-    String(event.keyword || '').trim().toLowerCase()
+    normalizeFilterKey(event.type || event.logType),
+    String(event.playerName || '').trim().toLowerCase()
+  ]);
+}
+
+function getEventSignatureFromRow(row, columns) {
+  if (!row?.[columns.timestamp] || !row?.[columns.eventType]) return '';
+  return JSON.stringify([
+    String(row[columns.timestamp]).trim(),
+    normalizeFilterKey(row[columns.eventType]),
+    String(row[columns.playerName] || '').trim().toLowerCase()
   ]);
 }
 
 function rememberEventSignatures(sheetId, events, callback = () => {}) {
   const storageKey = `${EVENT_SIGNATURES_KEY}:${sheetId || 'unconfigured'}`;
   const newSignatures = events.map(getEventSignature);
+  const inMemorySignatures = sheetEventSignatures.get(sheetId);
+  if (inMemorySignatures) newSignatures.forEach((signature) => inMemorySignatures.add(signature));
   chrome.storage.local.get({ [storageKey]: [] }, (result) => {
     const signatures = new Set(result[storageKey] || []);
     newSignatures.forEach((signature) => signatures.add(signature));
     chrome.storage.local.set({ [storageKey]: Array.from(signatures).slice(-MAX_EVENT_SIGNATURES) }, callback);
+  });
+}
+
+function loadSheetEventSignatures(accessToken, sheetId, sheetTitle, callback) {
+  if (sheetEventSignatures.has(sheetId)) {
+    callback();
+    return;
+  }
+
+  const waitingCallbacks = sheetSignatureLoadCallbacks.get(sheetId);
+  if (waitingCallbacks) {
+    waitingCallbacks.push(callback);
+    return;
+  }
+  sheetSignatureLoadCallbacks.set(sheetId, [callback]);
+
+  const valuesUrl = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(sheetId)}/values/${sheetRange(sheetTitle, 'A1:I')}`;
+  fetchJson(accessToken, valuesUrl).then((result) => {
+    if (!result.ok) {
+      console.warn('Could not read existing log rows for duplicate checking:', result.data);
+      return;
+    }
+
+    const rows = result.data.values || [];
+    const header = rows[0] || [];
+    const timestampColumn = header.findIndex((value) => String(value).trim() === 'Timestamp (UTC)');
+    const eventTypeColumn = header.findIndex((value) => String(value).trim() === 'Event Type');
+    const playerNameColumn = header.findIndex((value) => String(value).trim() === 'Player Name');
+    const columns = {
+      timestamp: timestampColumn >= 0 ? timestampColumn : 0,
+      eventType: eventTypeColumn >= 0 ? eventTypeColumn : 1,
+      playerName: playerNameColumn >= 0 ? playerNameColumn : 7
+    };
+    const signatures = new Set(rows.slice(1).map((row) => getEventSignatureFromRow(row, columns)).filter(Boolean));
+    sheetEventSignatures.set(sheetId, signatures);
+    const storageKey = `${EVENT_SIGNATURES_KEY}:${sheetId}`;
+    chrome.storage.local.set({ [storageKey]: Array.from(signatures).slice(-MAX_EVENT_SIGNATURES) });
+  }).catch((error) => {
+    console.warn('Could not load existing log rows for duplicate checking:', error);
+  }).finally(() => {
+    const callbacks = sheetSignatureLoadCallbacks.get(sheetId) || [];
+    sheetSignatureLoadCallbacks.delete(sheetId);
+    callbacks.forEach((next) => next());
   });
 }
 
@@ -124,8 +196,9 @@ function claimEventSignature(sheetId, event, callback) {
   inFlightEventSignatures.add(inFlightKey);
   chrome.storage.local.get({ [storageKey]: [], events: [] }, (result) => {
     const signatures = result[storageKey] || [];
+    const sheetSignatures = sheetEventSignatures.get(sheetId);
     const isPending = (result.events || []).some((pendingEvent) => getEventSignature(pendingEvent) === signature);
-    if (signatures.includes(signature) || isPending) {
+    if (signatures.includes(signature) || sheetSignatures?.has(signature) || isPending) {
       inFlightEventSignatures.delete(inFlightKey);
       callback(false, () => {});
       return;
@@ -150,10 +223,6 @@ function claimEventSignature(sheetId, event, callback) {
       });
     });
   });
-}
-
-function setLogSheetTitle(title, callback) {
-  chrome.storage.local.set({ logSheetTitle: title }, callback);
 }
 
 function sheetRange(sheetTitle, range) {
@@ -235,81 +304,47 @@ function isHeaderRow(row, headerRow) {
   return row.every((cell, index) => String(cell || '').trim() === headerRow[index]);
 }
 
-function ensureLogSheet(accessToken, sheetId, storedTitle, callback) {
-  if (storedTitle) {
-    const metadataUrl = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(sheetId)}?fields=sheets(properties(title))`;
-    fetchJson(accessToken, metadataUrl).then((result) => {
-      if (result.ok) {
-        const sheets = result.data.sheets || [];
-        const storedSheetExists = sheets.some((sheet) => sheet.properties?.title === storedTitle);
-        if (!storedSheetExists) {
-          const signatureKey = `${EVENT_SIGNATURES_KEY}:${sheetId}`;
-          chrome.storage.local.remove(signatureKey, () => {
-            createSheet(accessToken, sheetId, storedTitle, HEADER_ROW, (sheetTitle) => {
-              setLogSheetTitle(sheetTitle, () => callback(sheetTitle));
-            });
-          });
-          return;
-        }
-      }
-
-      ensureSheetWithHeader(accessToken, sheetId, storedTitle, HEADER_ROW, callback);
-    }).catch((error) => {
-      console.warn('Could not verify the log sheet exists:', error);
-      ensureSheetWithHeader(accessToken, sheetId, storedTitle, HEADER_ROW, callback);
-    });
-    return;
-  }
-
+function ensureLogSheet(accessToken, sheetId, callback) {
   const metadataUrl = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(sheetId)}?fields=sheets(properties(title))`;
   fetchJson(accessToken, metadataUrl).then((result) => {
     if (!result.ok) {
-      console.warn('Could not read spreadsheet metadata:', result.data);
-      createSheet(accessToken, sheetId, DEFAULT_SHEET_TITLE, HEADER_ROW, (sheetTitle) => {
-        setLogSheetTitle(sheetTitle, () => callback(sheetTitle));
-      });
+      console.warn('Could not verify the spreadsheet tabs:', result.data);
+      ensureSheetWithHeader(accessToken, sheetId, DEFAULT_SHEET_TITLE, HEADER_ROW, callback);
       return;
     }
 
     const sheets = result.data.sheets || [];
-    const firstSheetTitle = sheets[0]?.properties?.title || DEFAULT_SHEET_TITLE;
-    const valuesUrl = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(sheetId)}/values/${sheetRange(firstSheetTitle, 'A1:1')}`;
+    const logSheetExists = sheets.some((sheet) => sheet.properties?.title === DEFAULT_SHEET_TITLE);
+    if (logSheetExists) {
+      ensureSheetWithHeader(accessToken, sheetId, DEFAULT_SHEET_TITLE, HEADER_ROW, callback);
+      return;
+    }
 
-    fetchJson(accessToken, valuesUrl).then((valuesResult) => {
-      if (valuesResult.ok) {
-        const values = valuesResult.data.values || [];
-        if (values.length && isHeaderRow(values[0], HEADER_ROW)) {
-          setLogSheetTitle(firstSheetTitle, () => callback(firstSheetTitle));
-          return;
-        }
-        if (!values.length || !values[0].some(Boolean)) {
-          writeHeaderRow(accessToken, sheetId, firstSheetTitle, HEADER_ROW, () => {
-            setLogSheetTitle(firstSheetTitle, () => callback(firstSheetTitle));
-          });
-          return;
-        }
-      }
-
-      const newTitle = `${DEFAULT_SHEET_TITLE}-${Date.now()}`;
-      createSheet(accessToken, sheetId, newTitle, HEADER_ROW, (sheetTitle) => {
-        setLogSheetTitle(sheetTitle, () => callback(sheetTitle));
-      });
-    }).catch((error) => {
-      console.warn('Could not read header row:', error);
-      createSheet(accessToken, sheetId, DEFAULT_SHEET_TITLE, HEADER_ROW, (sheetTitle) => {
-        setLogSheetTitle(sheetTitle, () => callback(sheetTitle));
-      });
+    const signatureKey = `${EVENT_SIGNATURES_KEY}:${sheetId}`;
+    chrome.storage.local.remove(signatureKey, () => {
+      sheetEventSignatures.delete(sheetId);
+      createSheet(accessToken, sheetId, DEFAULT_SHEET_TITLE, HEADER_ROW, callback);
     });
   }).catch((error) => {
-    console.warn('Could not ensure log sheet:', error);
-    createSheet(accessToken, sheetId, DEFAULT_SHEET_TITLE, HEADER_ROW, (sheetTitle) => {
-      setLogSheetTitle(sheetTitle, () => callback(sheetTitle));
-    });
+    console.warn('Could not verify the spreadsheet tabs:', error);
+    ensureSheetWithHeader(accessToken, sheetId, DEFAULT_SHEET_TITLE, HEADER_ROW, callback);
   });
 }
 
 function ensureVerbatimSheet(accessToken, sheetId, callback) {
   ensureSheetWithHeader(accessToken, sheetId, VERBATIM_SHEET_TITLE, VERBATIM_HEADER_ROW, callback);
+}
+
+function prepareConfiguredSheets(accessToken, sheetId, verboseLoggingEnabled) {
+  flushPendingEvents(accessToken, sheetId);
+  if (accessToken && sheetId && verboseLoggingEnabled) {
+    ensureVerbatimSheet(accessToken, sheetId, () => {
+      flushPendingRawLines(accessToken, sheetId, true);
+    });
+    return;
+  }
+
+  flushPendingRawLines(accessToken, sheetId, verboseLoggingEnabled);
 }
 
 function appendRowsToSheet(accessToken, sheetId, sheetTitle, rows) {
@@ -340,7 +375,7 @@ function savePendingRawLine(rawLine, callback) {
   });
 }
 
-function flushPendingEvents(accessToken, sheetId, storedTitle) {
+function flushPendingEvents(accessToken, sheetId) {
   if (!accessToken || !sheetId) return;
 
   chrome.storage.local.get({ events: [] }, (result) => {
@@ -356,18 +391,27 @@ function flushPendingEvents(accessToken, sheetId, storedTitle) {
       uniqueEvents.push(event);
     }
 
-    ensureLogSheet(accessToken, sheetId, storedTitle, (sheetTitle) => {
-      const rows = uniqueEvents.map(buildRowForEvent);
-      appendRowsToSheet(accessToken, sheetId, sheetTitle, rows)
-        .then((response) => {
-          if (response.ok) {
-            rememberEventSignatures(sheetId, uniqueEvents, () => chrome.storage.local.remove('events'));
-          } else {
-            console.warn('Could not flush pending events:', response.status, response.statusText);
-          }
-        })
-        .catch((error) => {
-          console.warn('Network error while flushing pending events:', error);
+    ensureLogSheet(accessToken, sheetId, (sheetTitle) => {
+      loadSheetEventSignatures(accessToken, sheetId, sheetTitle, () => {
+        const existingSignatures = sheetEventSignatures.get(sheetId) || new Set();
+        const newEvents = uniqueEvents.filter((event) => !existingSignatures.has(getEventSignature(event)));
+        if (!newEvents.length) {
+          chrome.storage.local.remove('events');
+          return;
+        }
+
+        const rows = newEvents.map(buildRowForEvent);
+        appendRowsToSheet(accessToken, sheetId, sheetTitle, rows)
+          .then((response) => {
+            if (response.ok) {
+              rememberEventSignatures(sheetId, newEvents, () => chrome.storage.local.remove('events'));
+            } else {
+              console.warn('Could not flush pending events:', response.status, response.statusText);
+            }
+          })
+          .catch((error) => {
+            console.warn('Network error while flushing pending events:', error);
+          });
         });
     });
   });
@@ -417,51 +461,56 @@ function shouldLogEvent(event, enabledEventTypes) {
 function handleParsedEvent(event, senderUrl) {
   const savedEvent = Object.assign({ sourceUrl: senderUrl || null }, event);
 
-  getStoredState(({ accessToken, sheetId, enabledEventTypes, logSheetTitle }) => {
+  getStoredState(({ accessToken, sheetId, enabledEventTypes }) => {
     if (!shouldLogEvent(savedEvent, enabledEventTypes)) {
       return;
     }
 
-    claimEventSignature(sheetId, savedEvent, (isNewEvent, finishSignature) => {
-      if (!isNewEvent) return;
-
-      if (!accessToken || !sheetId) {
+    if (!accessToken || !sheetId) {
+      claimEventSignature(sheetId, savedEvent, (isNewEvent, finishSignature) => {
+        if (!isNewEvent) return;
         savePendingEvent(savedEvent, () => {
           finishSignature(false);
           console.log('Event saved locally until OAuth and sheet settings are configured.', savedEvent);
         });
-        return;
-      }
+      });
+      return;
+    }
 
-      ensureLogSheet(accessToken, sheetId, logSheetTitle, (sheetTitle) => {
-        const row = buildRowForEvent(savedEvent);
-        appendRowsToSheet(accessToken, sheetId, sheetTitle, [row])
-          .then((response) => {
-            if (response.ok) {
-              finishSignature(true);
-              return;
-            }
+    ensureLogSheet(accessToken, sheetId, (sheetTitle) => {
+      loadSheetEventSignatures(accessToken, sheetId, sheetTitle, () => {
+        claimEventSignature(sheetId, savedEvent, (isNewEvent, finishSignature) => {
+          if (!isNewEvent) return;
 
-            if (response.status === 401 || response.status === 403) {
-              chrome.storage.local.remove(['googleAccessToken', 'tokenExpiry'], () => {
+          const row = buildRowForEvent(savedEvent);
+          appendRowsToSheet(accessToken, sheetId, sheetTitle, [row])
+            .then((response) => {
+              if (response.ok) {
+                finishSignature(true);
+                return;
+              }
+
+              if (response.status === 401 || response.status === 403) {
+                chrome.identity.removeCachedAuthToken({ token: accessToken }, () => {
+                  savePendingEvent(savedEvent, () => {
+                    finishSignature(false);
+                    console.warn('Google rejected the cached token. It was cleared and the event saved locally; authorize again if prompted.');
+                  });
+                });
+              } else {
                 savePendingEvent(savedEvent, () => {
                   finishSignature(false);
-                  console.warn('Authorization failed. Saved event locally and cleared expired token. Re-authorize in setup.');
+                  console.warn('Failed to append event to Google Sheets. Saved locally.', response.status);
                 });
-              });
-            } else {
+              }
+            })
+            .catch((error) => {
               savePendingEvent(savedEvent, () => {
                 finishSignature(false);
-                console.warn('Failed to append event to Google Sheets. Saved locally.', response.status);
+                console.warn('Network or Sheets API error. Saved event locally.', error);
               });
-            }
-          })
-          .catch((error) => {
-            savePendingEvent(savedEvent, () => {
-              finishSignature(false);
-              console.warn('Network or Sheets API error. Saved event locally.', error);
             });
-          });
+        });
       });
     });
   });
@@ -486,9 +535,9 @@ function handleRawConsoleLine(line, timestamp) {
         .then((response) => {
           if (!response.ok) {
             if (response.status === 401 || response.status === 403) {
-              chrome.storage.local.remove(['googleAccessToken', 'tokenExpiry'], () => {
+              chrome.identity.removeCachedAuthToken({ token: accessToken }, () => {
                 savePendingRawLine(rawLine, () => {
-                  console.warn('Authorization failed for verbose logging. Saved raw line locally. Re-authorize in setup.');
+                  console.warn('Google rejected the cached token for verbose logging. The token was cleared and the raw line saved locally.');
                 });
               });
             } else {
@@ -508,17 +557,16 @@ function handleRawConsoleLine(line, timestamp) {
 }
 
 chrome.runtime.onInstalled.addListener(() => {
+  chrome.storage.local.remove(['googleAccessToken', 'tokenExpiry', 'googleClientId']);
   openSetupPage();
-  getStoredState(({ accessToken, sheetId, logSheetTitle, verboseLoggingEnabled }) => {
-    flushPendingEvents(accessToken, sheetId, logSheetTitle);
-    flushPendingRawLines(accessToken, sheetId, verboseLoggingEnabled);
+  getStoredState(({ accessToken, sheetId, verboseLoggingEnabled }) => {
+    prepareConfiguredSheets(accessToken, sheetId, verboseLoggingEnabled);
   });
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  getStoredState(({ accessToken, sheetId, logSheetTitle, verboseLoggingEnabled }) => {
-    flushPendingEvents(accessToken, sheetId, logSheetTitle);
-    flushPendingRawLines(accessToken, sheetId, verboseLoggingEnabled);
+  getStoredState(({ accessToken, sheetId, verboseLoggingEnabled }) => {
+    prepareConfiguredSheets(accessToken, sheetId, verboseLoggingEnabled);
   });
 });
 
@@ -527,7 +575,15 @@ chrome.action.onClicked.addListener(openSetupPage);
 chrome.runtime.onMessage.addListener((message, sender) => {
   if (!message || typeof message.type !== 'string') return;
 
-  if (message.type === 'parsedEvent') {
+  if (message.type === 'authorizationUpdated') {
+    getStoredState(({ accessToken, sheetId, verboseLoggingEnabled }) => {
+      prepareConfiguredSheets(accessToken, sheetId, verboseLoggingEnabled);
+    });
+  } else if (message.type === 'settingsUpdated') {
+    getStoredState(({ accessToken, sheetId, verboseLoggingEnabled }) => {
+      prepareConfiguredSheets(accessToken, sheetId, verboseLoggingEnabled);
+    });
+  } else if (message.type === 'parsedEvent') {
     handleParsedEvent(message.event, sender.tab?.url);
   } else if (message.type === 'rawConsoleLine') {
     handleRawConsoleLine(message.line, message.timestamp);
@@ -535,18 +591,12 @@ chrome.runtime.onMessage.addListener((message, sender) => {
 });
 
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area !== 'local') return;
+  if (area !== 'local' && area !== 'sync') return;
 
-  if (changes.googleAccessToken || changes.tokenExpiry || changes.sheetId || changes.verboseLoggingEnabled) {
-    chrome.storage.local.get(['googleAccessToken', 'tokenExpiry', 'sheetId', 'logSheetTitle', 'verboseLoggingEnabled'], (result) => {
-      const accessToken = result.googleAccessToken;
-      const tokenExpiry = result.tokenExpiry || 0;
-      const sheetId = result.sheetId;
-      const logSheetTitle = result.logSheetTitle;
-      const verboseLoggingEnabled = !!result.verboseLoggingEnabled;
-      if (accessToken && sheetId && Date.now() < tokenExpiry) {
-        flushPendingEvents(accessToken, sheetId, logSheetTitle);
-        flushPendingRawLines(accessToken, sheetId, verboseLoggingEnabled);
+  if ((area === 'sync' && changes.sheetId) || (area === 'local' && changes.verboseLoggingEnabled)) {
+    getStoredState(({ accessToken, sheetId, verboseLoggingEnabled }) => {
+      if (accessToken && sheetId) {
+        prepareConfiguredSheets(accessToken, sheetId, verboseLoggingEnabled);
       }
     });
   }
